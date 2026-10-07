@@ -1,0 +1,10 @@
+build/
+Debug/
+Release/
+Repository/
+.vscode/
+.DS_Store
+*.elf
+*.bin
+*.hex
+*.map
