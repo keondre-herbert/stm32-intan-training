@@ -105,6 +105,6 @@ with serial.Serial(PORT, BAUD_RATE, timeout=2) as ser:
                 start_time = time.monotonic()
 
             # Uncomment to inspect the first frame of each packet:
-            # print(f"SEQ {sequence}: {frames[0]}")
+            #print(f"SEQ {sequence}: {frames[0]}")
 
 # Stop with Ctrl+C

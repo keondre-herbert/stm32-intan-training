@@ -25,6 +25,7 @@
 #include "usbd_cdc_if.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 /* USER CODE END Includes */
 
@@ -68,6 +69,24 @@ static void MX_GPIO_Init(void);
 static uint8_t usb_packet[PACKET_SIZE];
 static uint32_t sequence = 0;
 
+#define RING_CAPACITY 256
+
+typedef struct
+{
+    uint32_t frame_index;
+    uint16_t channels[CHANNEL_COUNT];
+} SampleFrame;
+
+static SampleFrame ring_buffer[RING_CAPACITY];
+
+static uint32_t write_index = 0;
+static uint32_t read_index = 0;
+static uint32_t buffered_frames = 0;
+static uint32_t overrun_count = 0;
+
+static SampleFrame usb_batch[FRAMES_PER_PACKET];
+static uint32_t next_frame_index = 0;
+
 static void write_u16_le(uint8_t *destination, uint16_t value)
 {
     destination[0] = (uint8_t)value;
@@ -81,24 +100,78 @@ static void write_u32_le(uint8_t *destination, uint32_t value)
     destination[2] = (uint8_t)(value >> 16);
     destination[3] = (uint8_t)(value >> 24);
 }
-static void build_packet(uint32_t first_frame)
+static void build_packet(const SampleFrame *frames)
 {
     write_u32_le(&usb_packet[0], 0xA55A5AA5);
-    write_u32_le(&usb_packet[4], first_frame);
+
+    // Index of the first frame in this batch
+    write_u32_le(&usb_packet[4], frames[0].frame_index);
 
     for (int frame = 0; frame < FRAMES_PER_PACKET; frame++)
     {
         for (int ch = 0; ch < CHANNEL_COUNT; ch++)
         {
-            uint16_t sample = (uint16_t)(
-                1000 + ch * 100 + ((first_frame + frame) % 100)
-            );
-
             int offset = 8 + (frame * CHANNEL_COUNT + ch) * 2;
-            write_u16_le(&usb_packet[offset], sample);
+
+            write_u16_le(
+                &usb_packet[offset],
+                frames[frame].channels[ch]
+            );
         }
     }
 }
+
+
+
+
+static bool push_frame(const SampleFrame *frame)
+{
+    if (buffered_frames == RING_CAPACITY)
+    {
+        overrun_count++;
+        return false;
+    }
+
+    ring_buffer[write_index] = *frame;
+
+    write_index = (write_index + 1) % RING_CAPACITY;
+    buffered_frames++;
+
+    return true;
+}
+
+
+static bool pop_frame(SampleFrame *frame)
+{
+    if (buffered_frames == 0)
+    {
+        return false;
+    }
+
+    *frame = ring_buffer[read_index];
+
+    read_index = (read_index + 1) % RING_CAPACITY;
+    buffered_frames--;
+
+    return true;
+}
+
+static void generate_frame(void)
+{
+    SampleFrame frame;
+
+    frame.frame_index = next_frame_index++;
+
+    for (int ch = 0; ch < CHANNEL_COUNT; ch++)
+    {
+        frame.channels[ch] = (uint16_t)(
+            1000 + ch * 100 + (frame.frame_index % 100)
+        );
+    }
+
+    push_frame(&frame);
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -138,6 +211,30 @@ int main(void)
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
+SampleFrame test_frame = {0};
+SampleFrame received_frame = {0};
+
+// Generate 16 synthetic channel values
+test_frame.frame_index = 123;
+
+for (int ch = 0; ch < CHANNEL_COUNT; ch++)
+{
+    test_frame.channels[ch] = 1000 + ch * 100;
+}
+
+// Insert the frame into the ring buffer
+bool pushed = push_frame(&test_frame);
+
+// Retrieve it
+bool popped = pop_frame(&received_frame);
+
+// Set breakpoint here
+volatile uint32_t test_result =
+    (pushed && popped &&
+     received_frame.frame_index == 123 &&
+     received_frame.channels[0] == 1000 &&
+     received_frame.channels[15] == 2500);
+
 
   /* USER CODE END 2 */
 
@@ -162,27 +259,46 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    if (usb_tx_complete)
+  static bool packet_pending = false;
+ 
+while (1)
+{
+    // Simulate acquisition independently of USB readiness
+    if (buffered_frames < RING_CAPACITY)
     {
-        // Reserve the buffer before starting another transfer
-        usb_tx_complete = 0;
+        generate_frame();
+    }
 
-        build_packet(sequence);
+    // Build a new packet only when no packet is pending
+    if (!packet_pending &&
+        usb_tx_complete &&
+        buffered_frames >= FRAMES_PER_PACKET)
+    {
+        for (int i = 0; i < FRAMES_PER_PACKET; i++)
+        {
+            pop_frame(&usb_batch[i]);
+        }
+
+        build_packet(usb_batch);
+        packet_pending = true;
+    }
+
+    // Attempt to send the pending packet
+    if (packet_pending && usb_tx_complete)
+    {
+        usb_tx_complete = 0;
 
         if (CDC_Transmit_FS(usb_packet, PACKET_SIZE) == USBD_OK)
         {
-            sequence += FRAMES_PER_PACKET;
+            packet_pending = false;
         }
         else
         {
-            // USB did not accept this transfer.
-            // Allow the main loop to retry.
+            // Keep the same packet for another attempt
             usb_tx_complete = 1;
-            HAL_Delay(1);
         }
     }
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
