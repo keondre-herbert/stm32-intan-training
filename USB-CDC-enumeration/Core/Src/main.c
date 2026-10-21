@@ -169,7 +169,7 @@ int main(void)
     if (CDC_Transmit_FS(usb_packet, PACKET_SIZE) == USBD_OK)
     {
         sequence++;
-        HAL_Delay(1000);
+        HAL_Delay(10);
     }
     else
     {
