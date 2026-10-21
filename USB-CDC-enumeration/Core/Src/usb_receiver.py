@@ -3,75 +3,108 @@ import serial
 import struct
 import time
 
-PORT = "COM5"        # Replace with your STM32 User USB port
+# USB configuration
+PORT = "COM5"
 BAUD_RATE = 115200
+
+# STIMRIG protocol configuration
 SYNC = bytes.fromhex("A5 5A 5A A5")
-PACKET_SIZE = 40
+FRAMES_PER_PACKET = 16
+CHANNEL_COUNT = 16
+PACKET_SIZE = 8 + FRAMES_PER_PACKET * CHANNEL_COUNT * 2
 
-start_time = time.monotonic()
+# Statistics
 packets_received = 0
-
-missing_packets = 0 # Count of missing packets
+missing_frames = 0
+last_seq = None
+start_time = time.monotonic()
 
 with serial.Serial(PORT, BAUD_RATE, timeout=2) as ser:
     print(f"Connected to {PORT}")
+    print(f"Packet size: {PACKET_SIZE} bytes")
     print("Waiting for STIMRIG binary packets...\n")
 
     buffer = bytearray()
-    last_seq = None
 
     while True:
-        buffer.extend(ser.read(256))
+        # Read incoming USB CDC bytes
+        buffer.extend(ser.read(1024))
 
         while True:
+            # Find start of packet
             start = buffer.find(SYNC)
 
             if start == -1:
-                # Keep the final 3 bytes in case SYNC is split
-                # across two serial reads.
-                if len(buffer) > 3:
-                    del buffer[:-3]
+                # Preserve possible partial sync marker
+                if len(buffer) > len(SYNC) - 1:
+                    del buffer[:-(len(SYNC) - 1)]
                 break
 
-            # Discard anything preceding the sync marker.
+            # Remove bytes before sync
             if start > 0:
                 del buffer[:start]
 
-            # Wait until the entire 40-byte frame is present.
+            # Wait until complete packet arrives
             if len(buffer) < PACKET_SIZE:
                 break
 
             packet = bytes(buffer[:PACKET_SIZE])
             del buffer[:PACKET_SIZE]
 
-            # Bytes 4-7: unsigned 32-bit sequence number
+            # Decode first sample-frame index
             sequence = struct.unpack_from("<I", packet, 4)[0]
 
-            # Bytes 8-39: sixteen unsigned 16-bit samples
-            channels = struct.unpack_from("<16H", packet, 8)
+            # Decode 16 frames x 16 channels
+            samples = struct.unpack_from(
+                f"<{FRAMES_PER_PACKET * CHANNEL_COUNT}H",
+                packet,
+                8
+            )
 
+            frames = [
+                samples[i * CHANNEL_COUNT:(i + 1) * CHANNEL_COUNT]
+                for i in range(FRAMES_PER_PACKET)
+            ]
+
+            # Detect missing sample frames
             if last_seq is not None:
-                expected = (last_seq + 1) & 0xFFFFFFFF
+                expected = (last_seq + FRAMES_PER_PACKET) & 0xFFFFFFFF
 
                 if sequence != expected:
-                    missing = (sequence - expected) & 0xFFFFFFFF
-                    missing_packets += missing
-                    print(f"Sequence gap! Missing {missing} frames")
+                    gap = (sequence - expected) & 0xFFFFFFFF
+                    missing_frames += gap
+
+                    print(
+                        f"Sequence gap: expected {expected}, "
+                        f"received {sequence}"
+                    )
 
             last_seq = sequence
-
             packets_received += 1
 
+            # Print statistics approximately once per second
             elapsed = time.monotonic() - start_time
 
             if elapsed >= 1.0:
+                packet_rate = packets_received / elapsed
+                throughput_kb = (
+                    packets_received * PACKET_SIZE / elapsed / 1000
+                )
+                frame_rate = (
+                    packets_received * FRAMES_PER_PACKET / elapsed
+                )
+
                 print(
-                    f"Rate: {packets_received / elapsed:.1f} packets/s | "
-                    f"{packets_received * 40 / elapsed / 1000:.2f} KB/s"
-                    f" | Missing packets: {missing_packets}"
+                    f"Rate: {packet_rate:.1f} packets/s | "
+                    f"{frame_rate:.1f} frames/s | "
+                    f"{throughput_kb:.2f} KB/s | "
+                    f"Missing frames: {missing_frames}"
                 )
 
                 packets_received = 0
                 start_time = time.monotonic()
 
-            # print(f"SEQ {sequence}: {channels}")
+            # Uncomment to inspect the first frame of each packet:
+            # print(f"SEQ {sequence}: {frames[0]}")
+
+# Stop with Ctrl+C

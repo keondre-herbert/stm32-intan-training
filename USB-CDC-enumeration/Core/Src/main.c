@@ -48,7 +48,7 @@
 COM_InitTypeDef BspCOMInit;
 
 /* USER CODE BEGIN PV */
-
+extern volatile uint8_t usb_tx_complete;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -62,7 +62,8 @@ static void MX_GPIO_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 #define CHANNEL_COUNT 16
-#define PACKET_SIZE 40
+#define FRAMES_PER_PACKET 16
+#define PACKET_SIZE (8 + FRAMES_PER_PACKET * CHANNEL_COUNT * 2)
 
 static uint8_t usb_packet[PACKET_SIZE];
 static uint32_t sequence = 0;
@@ -80,22 +81,22 @@ static void write_u32_le(uint8_t *destination, uint32_t value)
     destination[2] = (uint8_t)(value >> 16);
     destination[3] = (uint8_t)(value >> 24);
 }
-static void build_packet(uint32_t seq)
+static void build_packet(uint32_t first_frame)
 {
-    // First 4 bytes: synchronization marker
     write_u32_le(&usb_packet[0], 0xA55A5AA5);
+    write_u32_le(&usb_packet[4], first_frame);
 
-    // Next 4 bytes: sequence number
-    write_u32_le(&usb_packet[4], seq);
-
-    // Remaining 32 bytes: 16 channel values
-    for (int ch = 0; ch < CHANNEL_COUNT; ch++)
+    for (int frame = 0; frame < FRAMES_PER_PACKET; frame++)
     {
-        uint16_t sample = (uint16_t)(
-          1000 + ch * 100 + (seq % 100)
-        );
+        for (int ch = 0; ch < CHANNEL_COUNT; ch++)
+        {
+            uint16_t sample = (uint16_t)(
+                1000 + ch * 100 + ((first_frame + frame) % 100)
+            );
 
-        write_u16_le(&usb_packet[8 + ch * 2], sample);
+            int offset = 8 + (frame * CHANNEL_COUNT + ch) * 2;
+            write_u16_le(&usb_packet[offset], sample);
+        }
     }
 }
 /* USER CODE END 0 */
@@ -163,19 +164,25 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-     // Only build a new packet when USB is ready.
-    build_packet(sequence);
-
-    if (CDC_Transmit_FS(usb_packet, PACKET_SIZE) == USBD_OK)
+    if (usb_tx_complete)
     {
-        sequence++;
-        HAL_Delay(10);
-    }
-    else
-    {
-        HAL_Delay(10);
-    }
+        // Reserve the buffer before starting another transfer
+        usb_tx_complete = 0;
 
+        build_packet(sequence);
+
+        if (CDC_Transmit_FS(usb_packet, PACKET_SIZE) == USBD_OK)
+        {
+            sequence += FRAMES_PER_PACKET;
+        }
+        else
+        {
+            // USB did not accept this transfer.
+            // Allow the main loop to retry.
+            usb_tx_complete = 1;
+            HAL_Delay(1);
+        }
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
