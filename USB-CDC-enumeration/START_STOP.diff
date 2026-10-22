@@ -1,0 +1,453 @@
+--- before/Core/Src/main.c
++++ after/Core/Src/main.c
+@@ -52,7 +52,13 @@
+ TIM_HandleTypeDef htim2;
+ 
+ /* USER CODE BEGIN PV */
+-extern volatile uint8_t usb_tx_complete;
++typedef enum
++{
++    STOPPED = 0,
++    RUNNING,
++    WAITING_FOR_USB
++} AcquisitionState;
++volatile AcquisitionState acquisition_state = STOPPED;
+ /* USER CODE END PV */
+ 
+ /* Private function prototypes -----------------------------------------------*/
+@@ -220,7 +226,7 @@
+   MX_TIM2_Init();
+ 
+   /* USER CODE BEGIN 2 */
+-  HAL_TIM_Base_Start_IT(&htim2);
++  /* Acquisition starts only after a host START command. */
+ 
+   /* USER CODE END 2 */
+ 
+@@ -250,8 +256,55 @@
+ 
+ while (1)
+ {
++    /* Only main changes acquisition state. Keep command consumption and timer
++       transitions atomic against USB/TIM2 interrupts. No buffer memset needed. */
++    uint32_t control_primask = __get_PRIMASK();
++    __disable_irq();
++    AcquisitionCommand command = acquisition_command;
++    acquisition_command = ACQ_COMMAND_NONE;
++    if (command != ACQ_COMMAND_NONE ||
++        (!usb_cdc_connected && acquisition_state != STOPPED))
++    {
++        /* Stop first, including for START while already running. */
++        if (HAL_TIM_Base_Stop_IT(&htim2) != HAL_OK)
++        {
++            Error_Handler();
++        }
++        acquisition_state = STOPPED;
++        __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
++        HAL_NVIC_ClearPendingIRQ(TIM2_IRQn);
++        packet_pending = false;
++        write_index = 0;
++        read_index = 0;
++        buffered_frames = 0;
++        if (command == ACQ_COMMAND_START && usb_cdc_connected)
++        {
++            acquisition_state = WAITING_FOR_USB;
++        }
++    }
++    if (acquisition_state == WAITING_FOR_USB && usb_tx_complete)
++    {
++        /* Prior transfer completed or endpoints were closed by USB teardown.
++           Never clear/rebuild usb_packet while USB still owns it. */
++        next_frame_index = 0;
++        sequence = 0;
++        overrun_count = 0;
++        discontinuous_batches = 0;
++        usb_busy_count = 0;
++        timer_callback_count = 0;
++        __HAL_TIM_SET_COUNTER(&htim2, 0);
++        __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
++        HAL_NVIC_ClearPendingIRQ(TIM2_IRQn);
++        acquisition_state = RUNNING;
++        if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK)
++        {
++            Error_Handler();
++        }
++    }
++    __set_PRIMASK(control_primask);
++
+     // Assemble 16 frames when USB is ready
+-    if (!packet_pending && usb_tx_complete)
++    if (acquisition_state == RUNNING && !packet_pending && usb_tx_complete)
+     {
+         uint32_t primask = __get_PRIMASK();
+         __disable_irq();
+@@ -284,7 +337,10 @@
+     }
+ 
+     // Submit the assembled packet
+-    if (packet_pending && usb_tx_complete)
++    uint32_t transmit_primask = __get_PRIMASK();
++    __disable_irq();
++    if (acquisition_state == RUNNING && packet_pending && usb_tx_complete &&
++        acquisition_command == ACQ_COMMAND_NONE && usb_cdc_connected)
+     {
+         usb_tx_complete = 0;
+ 
+@@ -300,20 +356,7 @@
+         }
+     }
+ 
+-    if (packet_pending)
+-    {
+-        for (int i = 1; i < FRAMES_PER_PACKET; i++)
+-        {
+-            if (usb_batch[i].frame_index !=
+-                usb_batch[i - 1].frame_index + 1)
+-            {
+-                discontinuous_batches++;
+-            }
+-        }
+-
+-        build_packet(usb_batch);
+-    }
+-
++    __set_PRIMASK(transmit_primask);
+ 
+     /* USER CODE END WHILE */
+ 
+@@ -444,7 +487,7 @@
+ /* USER CODE BEGIN 4 */
+ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+ {
+-    if (htim->Instance == TIM2)
++    if (htim->Instance == TIM2 && acquisition_state == RUNNING)
+     {
+       timer_callback_count++;  
+       generate_frame();
+--- before/USB_DEVICE/App/usbd_cdc_if.c
++++ after/USB_DEVICE/App/usbd_cdc_if.c
+@@ -22,6 +22,7 @@
+ #include "usbd_cdc_if.h"
+ 
+ /* USER CODE BEGIN INCLUDE */
++#include <string.h>
+ 
+ /* USER CODE END INCLUDE */
+ 
+@@ -32,6 +33,13 @@
+ /* USER CODE BEGIN PV */
+ /* Private variables ---------------------------------------------------------*/
+ volatile uint8_t usb_tx_complete = 1;
++volatile uint8_t usb_cdc_connected = 0;
++volatile AcquisitionCommand acquisition_command = ACQ_COMMAND_NONE;
++volatile uint32_t start_command_count = 0;
++volatile uint32_t stop_command_count = 0;
++static char command_line[6];
++static uint8_t command_length = 0;
++static uint8_t command_overflow = 0;
+ /* USER CODE END PV */
+ 
+ /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
+@@ -152,6 +160,10 @@
+ static int8_t CDC_Init_FS(void)
+ {
+   /* USER CODE BEGIN 3 */
++  command_length = 0;
++  command_overflow = 0;
++  usb_tx_complete = 1;
++  usb_cdc_connected = 1;
+   /* Set Application Buffers */
+   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
+   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
+@@ -166,6 +178,12 @@
+ static int8_t CDC_DeInit_FS(void)
+ {
+   /* USER CODE BEGIN 4 */
++  /* The CDC class closes endpoints before this callback: TX is released. */
++  usb_cdc_connected = 0;
++  usb_tx_complete = 1;
++  acquisition_command = ACQ_COMMAND_STOP;
++  command_length = 0;
++  command_overflow = 0;
+   return (USBD_OK);
+   /* USER CODE END 4 */
+ }
+@@ -261,6 +279,42 @@
+ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
+ {
+   /* USER CODE BEGIN 6 */
++  /* CDC is a byte stream; retain partial lines across OUT packets.
++     Latest valid command wins; every START also stops before restarting. */
++  for (uint32_t i = 0; i < *Len; i++)
++  {
++    uint8_t byte = Buf[i];
++    if (byte == '\n')
++    {
++      uint8_t length = command_length;
++      if (length > 0 && command_line[length - 1] == '\r')
++      {
++        length--;
++      }
++      if (!command_overflow && length == 5 &&
++          memcmp(command_line, "START", 5) == 0)
++      {
++        start_command_count++;
++        acquisition_command = ACQ_COMMAND_START;
++      }
++      else if (!command_overflow && length == 4 &&
++               memcmp(command_line, "STOP", 4) == 0)
++      {
++        stop_command_count++;
++        acquisition_command = ACQ_COMMAND_STOP;
++      }
++      command_length = 0;
++      command_overflow = 0;
++    }
++    else if (command_length < sizeof(command_line))
++    {
++      command_line[command_length++] = (char)byte;
++    }
++    else
++    {
++      command_overflow = 1;
++    }
++  }
+   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
+   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+   return (USBD_OK);
+@@ -283,6 +337,12 @@
+   uint8_t result = USBD_OK;
+   /* USER CODE BEGIN 7 */
+   USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
++  /* Caller serializes submission against USB reset/deinitialization. */
++  if (!usb_cdc_connected || hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED ||
++      hcdc == NULL)
++  {
++    return USBD_FAIL;
++  }
+   if (hcdc->TxState != 0){
+     return USBD_BUSY;
+   }
+--- before/USB_DEVICE/App/usbd_cdc_if.h
++++ after/USB_DEVICE/App/usbd_cdc_if.h
+@@ -65,6 +65,12 @@
+   */
+ 
+ /* USER CODE BEGIN EXPORTED_TYPES */
++typedef enum
++{
++  ACQ_COMMAND_NONE = 0,
++  ACQ_COMMAND_START,
++  ACQ_COMMAND_STOP
++} AcquisitionCommand;
+ 
+ /* USER CODE END EXPORTED_TYPES */
+ 
+@@ -94,6 +100,12 @@
+ extern USBD_CDC_ItfTypeDef USBD_Interface_fops_FS;
+ 
+ /* USER CODE BEGIN EXPORTED_VARIABLES */
++extern volatile uint8_t usb_tx_complete;
++extern volatile uint8_t usb_cdc_connected;
++extern volatile AcquisitionCommand acquisition_command;
++/* Lifetime counts of valid commands, not reset by START. */
++extern volatile uint32_t start_command_count;
++extern volatile uint32_t stop_command_count;
+ 
+ /* USER CODE END EXPORTED_VARIABLES */
+ 
+--- before/Core/Src/usb_receiver.py
++++ after/Core/Src/usb_receiver.py
+@@ -19,100 +19,116 @@
+ last_seq = None
+ start_time = time.monotonic()
+ 
+-with serial.Serial(PORT, BAUD_RATE, timeout=2) as ser:
++with serial.Serial(PORT, BAUD_RATE, timeout=0.2, write_timeout=1) as ser:
+     print(f"Connected to {PORT}")
+     print(f"Packet size: {PACKET_SIZE} bytes")
+     print("Waiting for STIMRIG binary packets...\n")
+ 
++    # Discard bytes buffered by the OS from a previous session.
++    ser.reset_input_buffer()
+     buffer = bytearray()
+ 
+-    while True:
+-        # Read incoming USB CDC bytes
+-        buffer.extend(ser.read(1024))
++    try:
++        ser.write(b"START\n")
++        print("START sent. Press Ctrl+C to send STOP.")
++        while True:
++            # Read incoming USB CDC bytes
++            buffer.extend(ser.read(1024))
+ 
+-        while True:
+-            # Find start of packet
+-            start = buffer.find(SYNC)
++            while True:
++                # Find start of packet
++                start = buffer.find(SYNC)
+ 
+-            if start == -1:
+-                # Preserve possible partial sync marker
+-                if len(buffer) > len(SYNC) - 1:
+-                    del buffer[:-(len(SYNC) - 1)]
+-                break
++                if start == -1:
++                    # Preserve possible partial sync marker
++                    if len(buffer) > len(SYNC) - 1:
++                        del buffer[:-(len(SYNC) - 1)]
++                    break
+ 
+-            # Remove bytes before sync
+-            if start > 0:
+-                del buffer[:start]
++                # Remove bytes before sync
++                if start > 0:
++                    del buffer[:start]
+ 
+-            # Wait until complete packet arrives
+-            if len(buffer) < PACKET_SIZE:
+-                break
++                # Wait until complete packet arrives
++                if len(buffer) < PACKET_SIZE:
++                    break
+ 
+-            packet = bytes(buffer[:PACKET_SIZE])
+-            del buffer[:PACKET_SIZE]
++                packet = bytes(buffer[:PACKET_SIZE])
++                del buffer[:PACKET_SIZE]
+ 
+-            # Decode first sample-frame index
+-            sequence = struct.unpack_from("<I", packet, 4)[0]
++                # Decode first sample-frame index
++                sequence = struct.unpack_from("<I", packet, 4)[0]
+ 
+-            # Decode 16 frames x 16 channels
+-            samples = struct.unpack_from(
+-                f"<{FRAMES_PER_PACKET * CHANNEL_COUNT}H",
+-                packet,
+-                8
+-            )
++                # Decode 16 frames x 16 channels
++                samples = struct.unpack_from(
++                    f"<{FRAMES_PER_PACKET * CHANNEL_COUNT}H",
++                    packet,
++                    8
++                )
+ 
+-            frames = [
+-                samples[i * CHANNEL_COUNT:(i + 1) * CHANNEL_COUNT]
+-                for i in range(FRAMES_PER_PACKET)
+-            ]
++                frames = [
++                    samples[i * CHANNEL_COUNT:(i + 1) * CHANNEL_COUNT]
++                    for i in range(FRAMES_PER_PACKET)
++                ]
+ 
+-            # Detect missing sample frames
+-            if last_seq is not None:
+-                expected = (last_seq + FRAMES_PER_PACKET) & 0xFFFFFFFF
++                # Detect missing sample frames
++                if last_seq is not None:
++                    expected = (last_seq + FRAMES_PER_PACKET) & 0xFFFFFFFF
+ 
+-                if sequence != expected:
+-                    gap = (sequence - expected) & 0xFFFFFFFF
++                    if sequence != expected:
++                        gap = (sequence - expected) & 0xFFFFFFFF
++
++                        print(
++                            f"GAP: previous={last_seq}, "
++                            f"expected={expected}, "
++                            f"received={sequence}, "
++                            f"difference={gap}"
++                        )
++
++                        missing_frames += gap
++
++                        print(
++                            f"Sequence gap: expected {expected}, "
++                            f"received {sequence}"
++                        )
++
++                last_seq = sequence
++                packets_received += 1
++
++                # Print statistics approximately once per second
++                elapsed = time.monotonic() - start_time
++
++                if elapsed >= 1.0:
++                    packet_rate = packets_received / elapsed
++                    throughput_kb = (
++                        packets_received * PACKET_SIZE / elapsed / 1000
++                    )
++                    frame_rate = (
++                        packets_received * FRAMES_PER_PACKET / elapsed
++                    )
+ 
+                     print(
+-                        f"GAP: previous={last_seq}, "
+-                        f"expected={expected}, "
+-                        f"received={sequence}, "
+-                        f"difference={gap}"
++                        f"Rate: {packet_rate:.1f} packets/s | "
++                        f"{frame_rate:.1f} frames/s | "
++                        f"{throughput_kb:.2f} KB/s | "
++                        f"Missing frames: {missing_frames}"
+                     )
+ 
+-                    missing_frames += gap
++                    packets_received = 0
++                    start_time = time.monotonic()
+ 
+-                    print(
+-                        f"Sequence gap: expected {expected}, "
+-                        f"received {sequence}"
+-                    )
+-
+-            last_seq = sequence
+-            packets_received += 1
+-
+-            # Print statistics approximately once per second
+-            elapsed = time.monotonic() - start_time
+-
+-            if elapsed >= 1.0:
+-                packet_rate = packets_received / elapsed
+-                throughput_kb = (
+-                    packets_received * PACKET_SIZE / elapsed / 1000
+-                )
+-                frame_rate = (
+-                    packets_received * FRAMES_PER_PACKET / elapsed
+-                )
+-
+-                print(
+-                    f"Rate: {packet_rate:.1f} packets/s | "
+-                    f"{frame_rate:.1f} frames/s | "
+-                    f"{throughput_kb:.2f} KB/s | "
+-                    f"Missing frames: {missing_frames}"
+-                )
+-
+-                packets_received = 0
+-                start_time = time.monotonic()
+-
+-            # Uncomment to inspect the first frame of each packet:
+-            #print(f"SEQ {sequence}: {frames[0]}")
+-
+-# Stop with Ctrl+C
++                # Uncomment to inspect the first frame of each packet:
++                #print(f"SEQ {sequence}: {frames[0]}")
++    except KeyboardInterrupt:
++        print("\nStopping acquisition...")
++    finally:
++        try:
++            ser.write(b"STOP\n")
++            # Read for a bounded interval so an in-flight packet can complete.
++            # There is no STOP acknowledgment in the binary-only protocol.
++            deadline = time.monotonic() + 0.5
++            while time.monotonic() < deadline:
++                ser.read(1024)
++            print("STOP sent.")
++        except (serial.SerialException, serial.SerialTimeoutException, OSError) as exc:
++            print(f"Could not send/finish STOP: {exc}")
