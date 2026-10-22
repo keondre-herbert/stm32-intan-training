@@ -19,100 +19,116 @@ missing_frames = 0
 last_seq = None
 start_time = time.monotonic()
 
-with serial.Serial(PORT, BAUD_RATE, timeout=2) as ser:
+with serial.Serial(PORT, BAUD_RATE, timeout=0.2, write_timeout=1) as ser:
     print(f"Connected to {PORT}")
     print(f"Packet size: {PACKET_SIZE} bytes")
     print("Waiting for STIMRIG binary packets...\n")
 
+    # Discard bytes buffered by the OS from a previous session.
+    ser.reset_input_buffer()
     buffer = bytearray()
 
-    while True:
-        # Read incoming USB CDC bytes
-        buffer.extend(ser.read(1024))
-
+    try:
+        ser.write(b"START\n")
+        print("START sent. Press Ctrl+C to send STOP.")
         while True:
-            # Find start of packet
-            start = buffer.find(SYNC)
+            # Read incoming USB CDC bytes
+            buffer.extend(ser.read(1024))
 
-            if start == -1:
-                # Preserve possible partial sync marker
-                if len(buffer) > len(SYNC) - 1:
-                    del buffer[:-(len(SYNC) - 1)]
-                break
+            while True:
+                # Find start of packet
+                start = buffer.find(SYNC)
 
-            # Remove bytes before sync
-            if start > 0:
-                del buffer[:start]
+                if start == -1:
+                    # Preserve possible partial sync marker
+                    if len(buffer) > len(SYNC) - 1:
+                        del buffer[:-(len(SYNC) - 1)]
+                    break
 
-            # Wait until complete packet arrives
-            if len(buffer) < PACKET_SIZE:
-                break
+                # Remove bytes before sync
+                if start > 0:
+                    del buffer[:start]
 
-            packet = bytes(buffer[:PACKET_SIZE])
-            del buffer[:PACKET_SIZE]
+                # Wait until complete packet arrives
+                if len(buffer) < PACKET_SIZE:
+                    break
 
-            # Decode first sample-frame index
-            sequence = struct.unpack_from("<I", packet, 4)[0]
+                packet = bytes(buffer[:PACKET_SIZE])
+                del buffer[:PACKET_SIZE]
 
-            # Decode 16 frames x 16 channels
-            samples = struct.unpack_from(
-                f"<{FRAMES_PER_PACKET * CHANNEL_COUNT}H",
-                packet,
-                8
-            )
+                # Decode first sample-frame index
+                sequence = struct.unpack_from("<I", packet, 4)[0]
 
-            frames = [
-                samples[i * CHANNEL_COUNT:(i + 1) * CHANNEL_COUNT]
-                for i in range(FRAMES_PER_PACKET)
-            ]
+                # Decode 16 frames x 16 channels
+                samples = struct.unpack_from(
+                    f"<{FRAMES_PER_PACKET * CHANNEL_COUNT}H",
+                    packet,
+                    8
+                )
 
-            # Detect missing sample frames
-            if last_seq is not None:
-                expected = (last_seq + FRAMES_PER_PACKET) & 0xFFFFFFFF
+                frames = [
+                    samples[i * CHANNEL_COUNT:(i + 1) * CHANNEL_COUNT]
+                    for i in range(FRAMES_PER_PACKET)
+                ]
 
-                if sequence != expected:
-                    gap = (sequence - expected) & 0xFFFFFFFF
+                # Detect missing sample frames
+                if last_seq is not None:
+                    expected = (last_seq + FRAMES_PER_PACKET) & 0xFFFFFFFF
 
-                    print(
-                        f"GAP: previous={last_seq}, "
-                        f"expected={expected}, "
-                        f"received={sequence}, "
-                        f"difference={gap}"
+                    if sequence != expected:
+                        gap = (sequence - expected) & 0xFFFFFFFF
+
+                        print(
+                            f"GAP: previous={last_seq}, "
+                            f"expected={expected}, "
+                            f"received={sequence}, "
+                            f"difference={gap}"
+                        )
+
+                        missing_frames += gap
+
+                        print(
+                            f"Sequence gap: expected {expected}, "
+                            f"received {sequence}"
+                        )
+
+                last_seq = sequence
+                packets_received += 1
+
+                # Print statistics approximately once per second
+                elapsed = time.monotonic() - start_time
+
+                if elapsed >= 1.0:
+                    packet_rate = packets_received / elapsed
+                    throughput_kb = (
+                        packets_received * PACKET_SIZE / elapsed / 1000
+                    )
+                    frame_rate = (
+                        packets_received * FRAMES_PER_PACKET / elapsed
                     )
 
-                    missing_frames += gap
-
                     print(
-                        f"Sequence gap: expected {expected}, "
-                        f"received {sequence}"
+                        f"Rate: {packet_rate:.1f} packets/s | "
+                        f"{frame_rate:.1f} frames/s | "
+                        f"{throughput_kb:.2f} KB/s | "
+                        f"Missing frames: {missing_frames}"
                     )
 
-            last_seq = sequence
-            packets_received += 1
+                    packets_received = 0
+                    start_time = time.monotonic()
 
-            # Print statistics approximately once per second
-            elapsed = time.monotonic() - start_time
-
-            if elapsed >= 1.0:
-                packet_rate = packets_received / elapsed
-                throughput_kb = (
-                    packets_received * PACKET_SIZE / elapsed / 1000
-                )
-                frame_rate = (
-                    packets_received * FRAMES_PER_PACKET / elapsed
-                )
-
-                print(
-                    f"Rate: {packet_rate:.1f} packets/s | "
-                    f"{frame_rate:.1f} frames/s | "
-                    f"{throughput_kb:.2f} KB/s | "
-                    f"Missing frames: {missing_frames}"
-                )
-
-                packets_received = 0
-                start_time = time.monotonic()
-
-            # Uncomment to inspect the first frame of each packet:
-            #print(f"SEQ {sequence}: {frames[0]}")
-
-# Stop with Ctrl+C
+                # Uncomment to inspect the first frame of each packet:
+                #print(f"SEQ {sequence}: {frames[0]}")
+    except KeyboardInterrupt:
+        print("\nStopping acquisition...")
+    finally:
+        try:
+            ser.write(b"STOP\n")
+            # Read for a bounded interval so an in-flight packet can complete.
+            # There is no STOP acknowledgment in the binary-only protocol.
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                ser.read(1024)
+            print("STOP sent.")
+        except (serial.SerialException, serial.SerialTimeoutException, OSError) as exc:
+            print(f"Could not send/finish STOP: {exc}")

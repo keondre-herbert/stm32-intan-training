@@ -65,6 +65,12 @@
   */
 
 /* USER CODE BEGIN EXPORTED_TYPES */
+typedef enum
+{
+  ACQ_COMMAND_NONE = 0,
+  ACQ_COMMAND_START,
+  ACQ_COMMAND_STOP
+} AcquisitionCommand;
 
 /* USER CODE END EXPORTED_TYPES */
 
@@ -94,6 +100,12 @@
 extern USBD_CDC_ItfTypeDef USBD_Interface_fops_FS;
 
 /* USER CODE BEGIN EXPORTED_VARIABLES */
+extern volatile uint8_t usb_tx_complete;
+extern volatile uint8_t usb_cdc_connected;
+extern volatile AcquisitionCommand acquisition_command;
+/* Lifetime counts of valid commands, not reset by START. */
+extern volatile uint32_t start_command_count;
+extern volatile uint32_t stop_command_count;
 
 /* USER CODE END EXPORTED_VARIABLES */
 

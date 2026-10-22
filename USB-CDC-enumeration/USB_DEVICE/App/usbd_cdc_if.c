@@ -22,6 +22,7 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
+#include <string.h>
 
 /* USER CODE END INCLUDE */
 
@@ -32,6 +33,13 @@
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
 volatile uint8_t usb_tx_complete = 1;
+volatile uint8_t usb_cdc_connected = 0;
+volatile AcquisitionCommand acquisition_command = ACQ_COMMAND_NONE;
+volatile uint32_t start_command_count = 0;
+volatile uint32_t stop_command_count = 0;
+static char command_line[6];
+static uint8_t command_length = 0;
+static uint8_t command_overflow = 0;
 /* USER CODE END PV */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
@@ -152,6 +160,10 @@ USBD_CDC_ItfTypeDef USBD_Interface_fops_FS =
 static int8_t CDC_Init_FS(void)
 {
   /* USER CODE BEGIN 3 */
+  command_length = 0;
+  command_overflow = 0;
+  usb_tx_complete = 1;
+  usb_cdc_connected = 1;
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
@@ -166,6 +178,12 @@ static int8_t CDC_Init_FS(void)
 static int8_t CDC_DeInit_FS(void)
 {
   /* USER CODE BEGIN 4 */
+  /* The CDC class closes endpoints before this callback: TX is released. */
+  usb_cdc_connected = 0;
+  usb_tx_complete = 1;
+  acquisition_command = ACQ_COMMAND_STOP;
+  command_length = 0;
+  command_overflow = 0;
   return (USBD_OK);
   /* USER CODE END 4 */
 }
@@ -261,6 +279,42 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
+  /* CDC is a byte stream; retain partial lines across OUT packets.
+     Latest valid command wins; every START also stops before restarting. */
+  for (uint32_t i = 0; i < *Len; i++)
+  {
+    uint8_t byte = Buf[i];
+    if (byte == '\n')
+    {
+      uint8_t length = command_length;
+      if (length > 0 && command_line[length - 1] == '\r')
+      {
+        length--;
+      }
+      if (!command_overflow && length == 5 &&
+          memcmp(command_line, "START", 5) == 0)
+      {
+        start_command_count++;
+        acquisition_command = ACQ_COMMAND_START;
+      }
+      else if (!command_overflow && length == 4 &&
+               memcmp(command_line, "STOP", 4) == 0)
+      {
+        stop_command_count++;
+        acquisition_command = ACQ_COMMAND_STOP;
+      }
+      command_length = 0;
+      command_overflow = 0;
+    }
+    else if (command_length < sizeof(command_line))
+    {
+      command_line[command_length++] = (char)byte;
+    }
+    else
+    {
+      command_overflow = 1;
+    }
+  }
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   return (USBD_OK);
@@ -283,6 +337,12 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
   uint8_t result = USBD_OK;
   /* USER CODE BEGIN 7 */
   USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
+  /* Caller serializes submission against USB reset/deinitialization. */
+  if (!usb_cdc_connected || hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED ||
+      hcdc == NULL)
+  {
+    return USBD_FAIL;
+  }
   if (hcdc->TxState != 0){
     return USBD_BUSY;
   }

@@ -52,7 +52,13 @@ COM_InitTypeDef BspCOMInit;
 TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
-extern volatile uint8_t usb_tx_complete;
+typedef enum
+{
+    STOPPED = 0,
+    RUNNING,
+    WAITING_FOR_USB
+} AcquisitionState;
+volatile AcquisitionState acquisition_state = STOPPED;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -86,8 +92,10 @@ static SampleFrame ring_buffer[RING_CAPACITY];
 static volatile uint32_t write_index = 0;
 static volatile uint32_t read_index = 0;
 static volatile uint32_t buffered_frames = 0;
+// diagnostic counters
 static volatile uint32_t overrun_count = 0;
 static volatile uint32_t discontinuous_batches = 0;
+static volatile uint32_t usb_busy_count = 0;
 
 static SampleFrame usb_batch[FRAMES_PER_PACKET];
 static uint32_t next_frame_index = 0;
@@ -218,7 +226,7 @@ int main(void)
   MX_TIM2_Init();
 
   /* USER CODE BEGIN 2 */
-  HAL_TIM_Base_Start_IT(&htim2);
+  /* Acquisition starts only after a host START command. */
 
   /* USER CODE END 2 */
 
@@ -248,8 +256,55 @@ int main(void)
 
 while (1)
 {
+    /* Only main changes acquisition state. Keep command consumption and timer
+       transitions atomic against USB/TIM2 interrupts. No buffer memset needed. */
+    uint32_t control_primask = __get_PRIMASK();
+    __disable_irq();
+    AcquisitionCommand command = acquisition_command;
+    acquisition_command = ACQ_COMMAND_NONE;
+    if (command != ACQ_COMMAND_NONE ||
+        (!usb_cdc_connected && acquisition_state != STOPPED))
+    {
+        /* Stop first, including for START while already running. */
+        if (HAL_TIM_Base_Stop_IT(&htim2) != HAL_OK)
+        {
+            Error_Handler();
+        }
+        acquisition_state = STOPPED;
+        __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
+        HAL_NVIC_ClearPendingIRQ(TIM2_IRQn);
+        packet_pending = false;
+        write_index = 0;
+        read_index = 0;
+        buffered_frames = 0;
+        if (command == ACQ_COMMAND_START && usb_cdc_connected)
+        {
+            acquisition_state = WAITING_FOR_USB;
+        }
+    }
+    if (acquisition_state == WAITING_FOR_USB && usb_tx_complete)
+    {
+        /* Prior transfer completed or endpoints were closed by USB teardown.
+           Never clear/rebuild usb_packet while USB still owns it. */
+        next_frame_index = 0;
+        sequence = 0;
+        overrun_count = 0;
+        discontinuous_batches = 0;
+        usb_busy_count = 0;
+        timer_callback_count = 0;
+        __HAL_TIM_SET_COUNTER(&htim2, 0);
+        __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
+        HAL_NVIC_ClearPendingIRQ(TIM2_IRQn);
+        acquisition_state = RUNNING;
+        if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK)
+        {
+            Error_Handler();
+        }
+    }
+    __set_PRIMASK(control_primask);
+
     // Assemble 16 frames when USB is ready
-    if (!packet_pending && usb_tx_complete)
+    if (acquisition_state == RUNNING && !packet_pending && usb_tx_complete)
     {
         uint32_t primask = __get_PRIMASK();
         __disable_irq();
@@ -268,12 +323,24 @@ while (1)
 
         if (packet_pending)
         {
+            for (int i = 1; i < FRAMES_PER_PACKET; i++)
+            {
+                if (usb_batch[i].frame_index !=
+                    usb_batch[i - 1].frame_index + 1)
+                {
+                    discontinuous_batches++;
+                }
+            }
+
             build_packet(usb_batch);
         }
     }
 
     // Submit the assembled packet
-    if (packet_pending && usb_tx_complete)
+    uint32_t transmit_primask = __get_PRIMASK();
+    __disable_irq();
+    if (acquisition_state == RUNNING && packet_pending && usb_tx_complete &&
+        acquisition_command == ACQ_COMMAND_NONE && usb_cdc_connected)
     {
         usb_tx_complete = 0;
 
@@ -284,24 +351,12 @@ while (1)
         else
         {
             // Retain the same packet for retry
+            usb_busy_count++;
             usb_tx_complete = 1;
         }
     }
 
-    if (packet_pending)
-    {
-        for (int i = 1; i < FRAMES_PER_PACKET; i++)
-        {
-            if (usb_batch[i].frame_index !=
-                usb_batch[i - 1].frame_index + 1)
-            {
-                discontinuous_batches++;
-            }
-        }
-
-        build_packet(usb_batch);
-    }
-
+    __set_PRIMASK(transmit_primask);
 
     /* USER CODE END WHILE */
 
@@ -432,7 +487,7 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM2)
+    if (htim->Instance == TIM2 && acquisition_state == RUNNING)
     {
       timer_callback_count++;  
       generate_frame();
