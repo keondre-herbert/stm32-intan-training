@@ -72,6 +72,14 @@ with serial.Serial(PORT, BAUD_RATE, timeout=2) as ser:
 
                 if sequence != expected:
                     gap = (sequence - expected) & 0xFFFFFFFF
+
+                    print(
+                        f"GAP: previous={last_seq}, "
+                        f"expected={expected}, "
+                        f"received={sequence}, "
+                        f"difference={gap}"
+                    )
+
                     missing_frames += gap
 
                     print(

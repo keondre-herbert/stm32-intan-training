@@ -22,6 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+// Standard libraries for memory and string operations
 #include "usbd_cdc_if.h"
 #include <string.h>
 #include <stdio.h>
@@ -48,6 +49,8 @@
 
 COM_InitTypeDef BspCOMInit;
 
+TIM_HandleTypeDef htim2;
+
 /* USER CODE BEGIN PV */
 extern volatile uint8_t usb_tx_complete;
 /* USER CODE END PV */
@@ -56,6 +59,7 @@ extern volatile uint8_t usb_tx_complete;
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -79,10 +83,11 @@ typedef struct
 
 static SampleFrame ring_buffer[RING_CAPACITY];
 
-static uint32_t write_index = 0;
-static uint32_t read_index = 0;
-static uint32_t buffered_frames = 0;
-static uint32_t overrun_count = 0;
+static volatile uint32_t write_index = 0;
+static volatile uint32_t read_index = 0;
+static volatile uint32_t buffered_frames = 0;
+static volatile uint32_t overrun_count = 0;
+static volatile uint32_t discontinuous_batches = 0;
 
 static SampleFrame usb_batch[FRAMES_PER_PACKET];
 static uint32_t next_frame_index = 0;
@@ -171,6 +176,7 @@ static void generate_frame(void)
 
     push_frame(&frame);
 }
+static volatile uint32_t timer_callback_count = 0;
 
 /* USER CODE END 0 */
 
@@ -209,32 +215,10 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USB_DEVICE_Init();
+  MX_TIM2_Init();
+
   /* USER CODE BEGIN 2 */
-
-SampleFrame test_frame = {0};
-SampleFrame received_frame = {0};
-
-// Generate 16 synthetic channel values
-test_frame.frame_index = 123;
-
-for (int ch = 0; ch < CHANNEL_COUNT; ch++)
-{
-    test_frame.channels[ch] = 1000 + ch * 100;
-}
-
-// Insert the frame into the ring buffer
-bool pushed = push_frame(&test_frame);
-
-// Retrieve it
-bool popped = pop_frame(&received_frame);
-
-// Set breakpoint here
-volatile uint32_t test_result =
-    (pushed && popped &&
-     received_frame.frame_index == 123 &&
-     received_frame.channels[0] == 1000 &&
-     received_frame.channels[15] == 2500);
-
+  HAL_TIM_Base_Start_IT(&htim2);
 
   /* USER CODE END 2 */
 
@@ -261,29 +245,34 @@ volatile uint32_t test_result =
   /* USER CODE BEGIN WHILE */
   static bool packet_pending = false;
  
+
 while (1)
 {
-    // Simulate acquisition independently of USB readiness
-    if (buffered_frames < RING_CAPACITY)
+    // Assemble 16 frames when USB is ready
+    if (!packet_pending && usb_tx_complete)
     {
-        generate_frame();
-    }
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
 
-    // Build a new packet only when no packet is pending
-    if (!packet_pending &&
-        usb_tx_complete &&
-        buffered_frames >= FRAMES_PER_PACKET)
-    {
-        for (int i = 0; i < FRAMES_PER_PACKET; i++)
+        if (buffered_frames >= FRAMES_PER_PACKET)
         {
-            pop_frame(&usb_batch[i]);
+            for (int i = 0; i < FRAMES_PER_PACKET; i++)
+            {
+                pop_frame(&usb_batch[i]);
+            }
+
+            packet_pending = true;
         }
 
-        build_packet(usb_batch);
-        packet_pending = true;
+        __set_PRIMASK(primask);
+
+        if (packet_pending)
+        {
+            build_packet(usb_batch);
+        }
     }
 
-    // Attempt to send the pending packet
+    // Submit the assembled packet
     if (packet_pending && usb_tx_complete)
     {
         usb_tx_complete = 0;
@@ -294,10 +283,25 @@ while (1)
         }
         else
         {
-            // Keep the same packet for another attempt
+            // Retain the same packet for retry
             usb_tx_complete = 1;
         }
     }
+
+    if (packet_pending)
+    {
+        for (int i = 1; i < FRAMES_PER_PACKET; i++)
+        {
+            if (usb_batch[i].frame_index !=
+                usb_batch[i - 1].frame_index + 1)
+            {
+                discontinuous_batches++;
+            }
+        }
+
+        build_packet(usb_batch);
+    }
+
 
     /* USER CODE END WHILE */
 
@@ -360,6 +364,51 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 63;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 999;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -381,6 +430,14 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2)
+    {
+      timer_callback_count++;  
+      generate_frame();
+    }
+}
 
 /* USER CODE END 4 */
 
